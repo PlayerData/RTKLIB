@@ -7,21 +7,21 @@ OPTS    = -DTRACE -DENAGLO -DENAQZS -DENAGAL -DENACMP -DENAIRN -DNFREQ=4 -DNEXOB
 #OPTS    = -DENAGLO -DENAQZS -DENAGAL -DENACMP -DNFREQ=2
 
 # for no lapack
-CFLAGS  = -std=c99 -Wall -O3 -pedantic -Wno-unused-but-set-variable -I$(SRC) $(OPTS)
-LDLIBS  = -lgfortran -lm
+CFLAGS  = -std=c99 -Wall -O3 -pedantic -Wno-unused-but-set-variable -I$(SRC) $(OPTS) -Wno-error=implicit-function-declaration -Wno-error=int-conversion
+LDLIBS  = -lm
 
 #CFLAGS  = -std=c99 -Wall -O3 -pedantic -Wno-unused-but-set-variable -I$(SRC) -DLAPACK $(OPTS)
-#LDLIBS  = -lm -lrt -llapack -lblas
+#LDLIBS  = -lm -llapack -lblas
 
 # for gprof
 #CFLAGS  = -std=c99 -Wall -O3 -pedantic -Wno-unused-but-set-variable -I$(SRC) -DLAPACK $(OPTS) -pg
-#LDLIBS  = -lm -lrt -llapack -lblas -pg
+#LDLIBS  = -lm -llapack -lblas -pg
 
 # for mkl
 ##MKLDIR  = /opt/intel/mkl
 #MKLDIR  = /proj/madoca/lib/mkl
 #CFLAGS  = -std=c99 -O3 -pedantic -Wno-unused-but-set-variable -I$(SRC) $(OPTS) -DMKL
-#LDLIBS  = -L$(MKLDIR)/intel64 -lmkl_intel_lp64 -lmkl_core -lmkl_gnu_thread -lpthread -lgomp -lm -lrt
+#LDLIBS  = -L$(MKLDIR)/intel64 -lmkl_intel_lp64 -lmkl_core -lmkl_gnu_thread -lpthread -lgomp -lm
 
 all        : rnx2rtkp
 rnx2rtkp   : rnx2rtkp.o rtkcmn.o trace.o rinex.o rtkpos.o postpos.o solution.o

@@ -2,7 +2,7 @@
 
 BINDIR = /usr/local/bin
 SRC    = ../../../../src
-CFLAGS = -std=c99 -Wall -O3 -pedantic -I$(SRC) -DTRACE
+CFLAGS = -std=c99 -Wall -O3 -pedantic -I$(SRC) -DTRACE -Wno-error=implicit-function-declaration -Wno-error=int-conversion
 LDLIBS = -lm
 
 pos2kml    : pos2kml.o convkml.o convgpx.o solution.o geoid.o rtkcmn.o trace.o preceph.o sofa.o

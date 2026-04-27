@@ -9,7 +9,7 @@ SRC    = ../../../../src
 INCLUDE= -I$(SRC)
 OPTIONS= -DTRACE -DENAGLO -DENAQZS -DENAGAL -DENACMP -DENAIRN -DNFREQ=4 -DNEXOBS=3
 
-CFLAGS = -std=c99 -O3 -pedantic -Wall -Wno-unused-but-set-variable $(INCLUDE) $(OPTIONS) -g
+CFLAGS = -std=c99 -O3 -pedantic -Wall -Wno-unused-but-set-variable $(INCLUDE) $(OPTIONS) -g -Wno-error=implicit-function-declaration -Wno-error=int-conversion
 LDLIBS = -lm
 
 all  : convbin

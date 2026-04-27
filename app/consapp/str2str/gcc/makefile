@@ -8,7 +8,7 @@ SRC    = ../../../../src
 CTARGET=
 
 OPTION = -DENAGLO -DENAGAL -DENAQZS -DENACMP -DENAIRN -DTRACE -DNFREQ=4 -DNEXOBS=3 -DSVR_REUSEADDR
-CFLAGS = -std=c99 -Wall -O3 -pedantic -Wno-unused-but-set-variable -I$(SRC) $(OPTION) $(CTARGET) -g
+CFLAGS = -std=c99 -Wall -O3 -pedantic -Wno-unused-but-set-variable -I$(SRC) $(OPTION) $(CTARGET) -g -Wno-error=implicit-function-declaration -Wno-error=int-conversion
 LDLIBS  = -lm -lpthread
 
 all        : str2str
