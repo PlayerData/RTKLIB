@@ -343,9 +343,16 @@ extern int loadopts(const char *file, opt_t *opts)
     opt_t *opt;
     char buff[2048],*p;
     int n=0;
-    
+    /* PlayerData patch: fail loadopts on any unrecognised key, malformed
+     * line, or invalid value. Stock RTKLIB silently ignores unknown keys,
+     * which masks typos in config files (e.g. `stats-rcverr` vs the real
+     * `stats-errrcv`). We accumulate all errors so a single run reports
+     * every problem instead of one-at-a-time.
+     */
+    int errors=0;
+
     trace(3,"loadopts: file=%s\n",file);
-    
+
     if (!(fp=fopen(file,"r"))) {
         trace(1,"loadopts: options file open error (%s)\n",file);
         return 0;
@@ -353,25 +360,31 @@ extern int loadopts(const char *file, opt_t *opts)
     while (fgets(buff,sizeof(buff),fp)) {
         n++;
         chop(buff);
-        
+
         if (buff[0]=='\0') continue;
-        
+
         if (!(p=strstr(buff,"="))) {
             fprintf(stderr,"invalid option %s (%s:%d)\n",buff,file,n);
+            errors++;
             continue;
         }
         *p++='\0';
         chop(buff);
-        if (!(opt=searchopt(buff,opts))) continue;
-        
+        if (!(opt=searchopt(buff,opts))) {
+            fprintf(stderr,"unknown option %s (%s:%d)\n",buff,file,n);
+            errors++;
+            continue;
+        }
+
         if (!str2opt(opt,p)) {
             fprintf(stderr,"invalid option value %s (%s:%d)\n",buff,file,n);
+            errors++;
             continue;
         }
     }
     fclose(fp);
-    
-    return 1;
+
+    return errors==0;
 }
 /* save options to file --------------------------------------------------------
 * save options to file
