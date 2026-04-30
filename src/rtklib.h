@@ -1087,6 +1087,7 @@ typedef struct {        /* processing options type */
     double odisp[2][2][11][3]; // Ocean tide loading parameters {rov,base}{amp,phase}
     int  freqopt;       /* disable L2-AR */
     char pppopt[256];   /* ppp option */
+    int  dopobs;        /* use doppler obs in kinematic EKF (0:off,1:on) */
 } prcopt_t;
 
 typedef struct {        /* solution options type */
