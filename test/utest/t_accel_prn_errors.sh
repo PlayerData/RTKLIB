@@ -7,11 +7,10 @@
 # Tests covered:
 #   A1  empty file
 #   A2  header-only (no data rows)
+#   A3  rows missing required value columns
 #   A5  duplicate timestamp
 #   A6  reverse order
 #   A8  unparseable time
-# (A3/A4/A7 dropped: trailing columns are intentionally tolerated, and the
-#  CSV no longer carries prn values so there's no "negative" path.)
 set -u
 
 BIN="${RNX2RTKP:-../../app/consapp/rnx2rtkp/gcc/rnx2rtkp}"
@@ -46,31 +45,38 @@ assert_fatal() {
 assert_fatal "A1 empty"        "$TMP/empty.csv"        "empty file"
 
 # A2: header only
-echo "time" > "$TMP/header_only.csv"
+echo "time,ae,an,au" > "$TMP/header_only.csv"
 assert_fatal "A2 header-only"  "$TMP/header_only.csv"  "no data rows"
 
-# A5: duplicate timestamp (== violates strict-increasing)
-cat > "$TMP/dup.csv" <<EOF
-time
-2024-01-15T12:00:00.000Z
+# A3: 1-column rows (missing values)
+cat > "$TMP/one_col.csv" <<EOF
+time,ae,an,au
 2024-01-15T12:00:00.000Z
 EOF
-assert_fatal "A5 duplicate-time" "$TMP/dup.csv"        "not strictly increasing"
+assert_fatal "A3 1-column" "$TMP/one_col.csv" "malformed row"
+
+# A5: duplicate timestamp (violates strict-increasing)
+cat > "$TMP/dup.csv" <<EOF
+time,ae,an,au
+2024-01-15T12:00:00.000Z,1,2,3
+2024-01-15T12:00:00.000Z,4,5,6
+EOF
+assert_fatal "A5 duplicate-time" "$TMP/dup.csv" "not strictly increasing"
 
 # A6: reverse order
 cat > "$TMP/reverse.csv" <<EOF
-time
-2024-01-15T12:00:01.000Z
-2024-01-15T12:00:00.000Z
+time,ae,an,au
+2024-01-15T12:00:01.000Z,1,2,3
+2024-01-15T12:00:00.000Z,4,5,6
 EOF
-assert_fatal "A6 reverse"      "$TMP/reverse.csv"      "not strictly increasing"
+assert_fatal "A6 reverse" "$TMP/reverse.csv" "not strictly increasing"
 
 # A8: unparseable time
 cat > "$TMP/badtime.csv" <<EOF
-time
-not-a-time
+time,ae,an,au
+not-a-time,1,2,3
 EOF
-assert_fatal "A8 bad-time"     "$TMP/badtime.csv"      "unparseable time"
+assert_fatal "A8 bad-time" "$TMP/badtime.csv" "unparseable time"
 
 # A_extra: missing file
 assert_fatal "A-extra missing-file" "$TMP/does_not_exist.csv" "cannot open"

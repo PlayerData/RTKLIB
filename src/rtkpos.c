@@ -561,26 +561,30 @@ static void udpos(rtk_t *rtk, double tt)
     }
     /* process noise added to only acceleration  P=P+Q
      *
-     * When the EKF interval [sol.time-tt, sol.time] is fully bracketed by
-     * loaded IMU coverage timestamps, use the active-coverage prn pair
-     * (opt.prn_imu_acch/_accv); otherwise fall back to the random-walk
-     * pair (opt.prn[3]/prn[4]). Both pairs are read from the RTKLIB conf
-     * (stats-prnaccelh-imu / stats-prnaccelv-imu and stats-prnaccelh /
-     * stats-prnaccelv respectively); the IMU CSV is purely a coverage
-     * signal here, no per-row prn values. */
+     * Two distinct models depending on whether the EKF interval
+     * [sol.time-tt, sol.time] is bracketed by loaded IMU samples:
+     *
+     *   covered:    Q[i,i] = prn_imu² · |dt| + ∫ a²(τ) dτ
+     *   not covered: Q[i,i] = prn_walk² · |dt|     (stock random-walk)
+     *
+     * The integral is the per-sample Σ aᵢ² · Δtᵢ from accel_prn_integrate
+     * (units m²/s³ — already includes Δt). The configured baseline
+     * prn_imu_acch/_accv enters as a measurement-noise-floor variance
+     * added in quadrature with the IMU signal's variance. */
     {
         gtime_t t_prev = timeadd(rtk->sol.time, -tt);
-        double prnh, prnv;
-        if (accel_prn_covered(t_prev, rtk->sol.time)) {
-            prnh = rtk->opt.prn_imu_acch;
-            prnv = rtk->opt.prn_imu_accv;
+        double qe2, qn2, qu2;
+        if (accel_prn_integrate(t_prev, rtk->sol.time, &qe2, &qn2, &qu2)) {
+            double base_h = SQR(rtk->opt.prn_imu_acch) * fabs(tt);
+            double base_v = SQR(rtk->opt.prn_imu_accv) * fabs(tt);
+            Q[0] = base_h + qe2;
+            Q[4] = base_h + qn2;
+            Q[8] = base_v + qu2;
         }
         else {
-            prnh = rtk->opt.prn[3];
-            prnv = rtk->opt.prn[4];
+            Q[0]=Q[4]=SQR(rtk->opt.prn[3])*fabs(tt);
+            Q[8]=     SQR(rtk->opt.prn[4])*fabs(tt);
         }
-        Q[0]=Q[4]=SQR(prnh)*fabs(tt);
-        Q[8]=     SQR(prnv)*fabs(tt);
     }
     ecef2pos(rtk->x,pos);
     covecef(pos,Q,Qv);

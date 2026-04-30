@@ -1,10 +1,10 @@
 /*------------------------------------------------------------------------------
-* accel_prn.c : IMU-coverage signal for EKF accel-state process noise.
+* accel_prn.c : per-axis IMU-accel sidecar — integrator over GPS epochs.
 *
-* Tracks just the timestamps of loaded IMU samples; the prn-std values
-* applied during/outside coverage live in prcopt_t.prn_imu_acch/_accv
-* (RTKLIB conf options stats-prnaccelh-imu / stats-prnaccelv-imu) and
-* prcopt_t.prn[3..4] (stats-prnaccelh / stats-prnaccelv) respectively.
+* Loads (time, a_E, a_N, a_U) rows; integrates Σ a²(τ) dτ per axis over a
+* GPS epoch interval using a piecewise-constant model. udpos combines that
+* with the configured baseline (rtk->opt.prn_imu_acch/_accv) — see
+* rtkpos.c for the assembled Q.
 *-----------------------------------------------------------------------------*/
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,8 +15,15 @@
 #include "rtklib.h"
 #include "accel_prn.h"
 
-static gtime_t *g_times = NULL;
-static int      g_n     = 0;
+typedef struct {
+    gtime_t t;
+    double  ae;   /* m/s² nav-frame east */
+    double  an;   /* m/s² nav-frame north */
+    double  au;   /* m/s² nav-frame up */
+} accel_sample_t;
+
+static accel_sample_t *g_samples = NULL;
+static int             g_n        = 0;
 
 static void die(const char *fmt, ...) {
     va_list ap;
@@ -36,6 +43,19 @@ static int parse_iso8601_gpst(const char *s, gtime_t *t) {
     return 0;
 }
 
+/* largest i such that g_samples[i].t <= t, or -1 if t precedes first sample */
+static int find_idx(gtime_t t) {
+    if (g_n == 0) return -1;
+    if (timediff(t, g_samples[0].t) < 0.0) return -1;
+    int lo = 0, hi = g_n - 1;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) / 2;
+        if (timediff(g_samples[mid].t, t) <= 0.0) lo = mid;
+        else hi = mid - 1;
+    }
+    return lo;
+}
+
 int accel_prn_load(const char *path) {
     if (!path || !*path) return 0;
 
@@ -44,8 +64,8 @@ int accel_prn_load(const char *path) {
 
     char line[512];
     int  lineno = 0, cap = 1024;
-    g_times = (gtime_t*)malloc((size_t)cap * sizeof(*g_times));
-    if (!g_times) die("oom");
+    g_samples = (accel_sample_t*)malloc((size_t)cap * sizeof(*g_samples));
+    if (!g_samples) die("oom");
     g_n = 0;
 
     if (!fgets(line, sizeof(line), fp)) die("%s: empty file", path);
@@ -58,38 +78,43 @@ int accel_prn_load(const char *path) {
         if (*p == '\0' || *p == '#') continue;
 
         char tbuf[64];
-        /* Parse only the first column. Trailing columns (if any) are ignored —
-           this file's role is coverage-only; the prn values applied during
-           coverage come from the RTKLIB conf, not the CSV. */
-        if (sscanf(line, "%63[^,\n]", tbuf) != 1)
-            die("%s:%d malformed row (need at least a time column)", path, lineno);
+        double ae = 0.0, an = 0.0, au = 0.0;
+        /* Positional parse: first 4 columns are (time, a_E, a_N, a_U) — column
+           names not enforced. Trailing columns (if any) are ignored. */
+        if (sscanf(line, "%63[^,],%lf,%lf,%lf", tbuf, &ae, &an, &au) != 4)
+            die("%s:%d malformed row (need time,a_E,a_N,a_U)", path, lineno);
 
         gtime_t t;
         if (parse_iso8601_gpst(tbuf, &t) < 0)
             die("%s:%d unparseable time '%s'", path, lineno, tbuf);
 
-        if (g_n > 0 && timediff(t, g_times[g_n-1]) <= 0.0)
+        if (g_n > 0 && timediff(t, g_samples[g_n-1].t) <= 0.0)
             die("%s:%d timestamps not strictly increasing", path, lineno);
 
         if (g_n == cap) {
             cap *= 2;
-            g_times = (gtime_t*)realloc(g_times, (size_t)cap * sizeof(*g_times));
-            if (!g_times) die("oom");
+            g_samples = (accel_sample_t*)realloc(
+                g_samples, (size_t)cap * sizeof(*g_samples));
+            if (!g_samples) die("oom");
         }
-        g_times[g_n++] = t;
+        g_samples[g_n].t  = t;
+        g_samples[g_n].ae = ae;
+        g_samples[g_n].an = an;
+        g_samples[g_n].au = au;
+        g_n++;
     }
     fclose(fp);
 
     if (g_n == 0) die("%s: no data rows", path);
 
-    fprintf(stderr, "accel_prn: loaded %d coverage timestamps from %s\n",
-            g_n, path);
+    fprintf(stderr, "accel_prn: loaded %d IMU samples from %s\n", g_n, path);
     return g_n;
 }
 
 int accel_prn_loaded(void) { return g_n > 0; }
 
-int accel_prn_covered(gtime_t t_lo_in, gtime_t t_hi_in) {
+int accel_prn_integrate(gtime_t t_lo_in, gtime_t t_hi_in,
+                        double *qe2, double *qn2, double *qu2) {
     if (g_n == 0) return 0;
     if (t_lo_in.time == 0 || t_hi_in.time == 0) return 0;
 
@@ -98,13 +123,42 @@ int accel_prn_covered(gtime_t t_lo_in, gtime_t t_hi_in) {
         gtime_t tmp = t_lo; t_lo = t_hi; t_hi = tmp;
     }
 
-    if (timediff(t_lo, g_times[0])     < 0.0) return 0;
-    if (timediff(t_hi, g_times[g_n-1]) > 0.0) return 0;
+    /* Strict coverage. See header for rationale. */
+    if (timediff(t_lo, g_samples[0].t)     < 0.0) return 0;
+    if (timediff(t_hi, g_samples[g_n-1].t) > 0.0) return 0;
+
+    /* Zero-width interval: integral is zero exactly. Treat as covered so
+     * the caller still adds its own config²·dt term (which is also zero
+     * when dt is 0). */
+    if (timediff(t_hi, t_lo) == 0.0) {
+        *qe2 = *qn2 = *qu2 = 0.0;
+        return 1;
+    }
+
+    int i_start = find_idx(t_lo);
+    int i_end   = find_idx(t_hi);
+    if (i_start < 0) return 0;
+
+    double sum_e = 0.0, sum_n = 0.0, sum_u = 0.0;
+    for (int i = i_start; i <= i_end; i++) {
+        gtime_t left  = (timediff(g_samples[i].t,   t_lo) > 0.0)
+                          ? g_samples[i].t   : t_lo;
+        gtime_t right = (timediff(g_samples[i+1].t, t_hi) < 0.0)
+                          ? g_samples[i+1].t : t_hi;
+        double dt = timediff(right, left);
+        if (dt <= 0.0) continue;
+        sum_e += g_samples[i].ae * g_samples[i].ae * dt;
+        sum_n += g_samples[i].an * g_samples[i].an * dt;
+        sum_u += g_samples[i].au * g_samples[i].au * dt;
+    }
+    *qe2 = sum_e;
+    *qn2 = sum_n;
+    *qu2 = sum_u;
     return 1;
 }
 
 void accel_prn_free(void) {
-    free(g_times);
-    g_times = NULL;
+    free(g_samples);
+    g_samples = NULL;
     g_n = 0;
 }
