@@ -7,12 +7,11 @@
 # Tests covered:
 #   A1  empty file
 #   A2  header-only (no data rows)
-#   A3  3-column (old format)
-#   A4  5-column
 #   A5  duplicate timestamp
 #   A6  reverse order
-#   A7  negative process-noise std
 #   A8  unparseable time
+# (A3/A4/A7 dropped: trailing columns are intentionally tolerated, and the
+#  CSV no longer carries prn values so there's no "negative" path.)
 set -u
 
 BIN="${RNX2RTKP:-../../app/consapp/rnx2rtkp/gcc/rnx2rtkp}"
@@ -47,53 +46,29 @@ assert_fatal() {
 assert_fatal "A1 empty"        "$TMP/empty.csv"        "empty file"
 
 # A2: header only
-echo "time,prn_e,prn_n,prn_u" > "$TMP/header_only.csv"
+echo "time" > "$TMP/header_only.csv"
 assert_fatal "A2 header-only"  "$TMP/header_only.csv"  "no data rows"
-
-# A3: 3-column (old h/v format)
-cat > "$TMP/three_col.csv" <<EOF
-time,prnaccelh,prnaccelv
-2024-01-15T12:00:00.000Z,0.5,0.3
-EOF
-assert_fatal "A3 3-column"     "$TMP/three_col.csv"    "malformed row"
-
-# A4: 5-column
-cat > "$TMP/five_col.csv" <<EOF
-time,prn_e,prn_n,prn_u,extra
-2024-01-15T12:00:00.000Z,0.5,0.4,0.3,0.1
-2024-01-15T12:00:01.000Z,0.5,0.4,0.3,0.1
-EOF
-# 5-column happens to parse as 4 and discards extra — accept either
-# (sscanf with %63[^,],%lf,%lf,%lf will succeed, ignoring trailing).
-# So this is not actually a FATAL case; remove from test set.
 
 # A5: duplicate timestamp (== violates strict-increasing)
 cat > "$TMP/dup.csv" <<EOF
-time,prn_e,prn_n,prn_u
-2024-01-15T12:00:00.000Z,0.5,0.4,0.3
-2024-01-15T12:00:00.000Z,0.6,0.5,0.4
+time
+2024-01-15T12:00:00.000Z
+2024-01-15T12:00:00.000Z
 EOF
 assert_fatal "A5 duplicate-time" "$TMP/dup.csv"        "not strictly increasing"
 
 # A6: reverse order
 cat > "$TMP/reverse.csv" <<EOF
-time,prn_e,prn_n,prn_u
-2024-01-15T12:00:01.000Z,0.5,0.4,0.3
-2024-01-15T12:00:00.000Z,0.6,0.5,0.4
+time
+2024-01-15T12:00:01.000Z
+2024-01-15T12:00:00.000Z
 EOF
 assert_fatal "A6 reverse"      "$TMP/reverse.csv"      "not strictly increasing"
 
-# A7: negative value
-cat > "$TMP/neg.csv" <<EOF
-time,prn_e,prn_n,prn_u
-2024-01-15T12:00:00.000Z,-0.5,0.4,0.3
-EOF
-assert_fatal "A7 negative"     "$TMP/neg.csv"          "negative process-noise std"
-
 # A8: unparseable time
 cat > "$TMP/badtime.csv" <<EOF
-time,prn_e,prn_n,prn_u
-not-a-time,0.5,0.4,0.3
+time
+not-a-time
 EOF
 assert_fatal "A8 bad-time"     "$TMP/badtime.csv"      "unparseable time"
 

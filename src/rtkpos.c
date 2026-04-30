@@ -559,24 +559,28 @@ static void udpos(rtk_t *rtk, double tt)
             rtk->P[ix[i]+ix[j]*rtk->nx]=P[i+j*nx];
         }
     }
-    /* process noise added to only acceleration  P=P+Q */
+    /* process noise added to only acceleration  P=P+Q
+     *
+     * When the EKF interval [sol.time-tt, sol.time] is fully bracketed by
+     * loaded IMU coverage timestamps, use the active-coverage prn pair
+     * (opt.prn_imu_acch/_accv); otherwise fall back to the random-walk
+     * pair (opt.prn[3]/prn[4]). Both pairs are read from the RTKLIB conf
+     * (stats-prnaccelh-imu / stats-prnaccelv-imu and stats-prnaccelh /
+     * stats-prnaccelv respectively); the IMU CSV is purely a coverage
+     * signal here, no per-row prn values. */
     {
-        /* The previous-epoch time is sol.time - tt: rtk->tt was just set as
-         * timediff(new, prev) at rtkpos.c entry. Range-integrate over the
-         * actual interval so high-rate IMU samples are summed correctly
-         * regardless of GNSS / IMU rate. */
         gtime_t t_prev = timeadd(rtk->sol.time, -tt);
-        double qe, qn, qu;
-        if (accel_prn_integrate(t_prev, rtk->sol.time, &qe, &qn, &qu)) {
-            /* qe/qn/qu already include the dt factor (units m^2/s^3). */
-            Q[0]=qe;
-            Q[4]=qn;
-            Q[8]=qu;
+        double prnh, prnv;
+        if (accel_prn_covered(t_prev, rtk->sol.time)) {
+            prnh = rtk->opt.prn_imu_acch;
+            prnv = rtk->opt.prn_imu_accv;
         }
         else {
-            Q[0]=Q[4]=SQR(rtk->opt.prn[3])*fabs(tt);
-            Q[8]=SQR(rtk->opt.prn[4])*fabs(tt);
+            prnh = rtk->opt.prn[3];
+            prnv = rtk->opt.prn[4];
         }
+        Q[0]=Q[4]=SQR(prnh)*fabs(tt);
+        Q[8]=     SQR(prnv)*fabs(tt);
     }
     ecef2pos(rtk->x,pos);
     covecef(pos,Q,Qv);

@@ -157,6 +157,8 @@ EXPORT opt_t sysopts[]={
     {"stats-stdtrop",   1,  (void *)&prcopt_.std[2],     "m"    },
     {"stats-prnaccelh", 1,  (void *)&prcopt_.prn[3],     "m/s^2"},
     {"stats-prnaccelv", 1,  (void *)&prcopt_.prn[4],     "m/s^2"},
+    {"stats-prnaccelh-imu",1,(void *)&prcopt_.prn_imu_acch,"m/s^2"},
+    {"stats-prnaccelv-imu",1,(void *)&prcopt_.prn_imu_accv,"m/s^2"},
     {"stats-prnbias",   1,  (void *)&prcopt_.prn[0],     "m"    },
     {"stats-prniono",   1,  (void *)&prcopt_.prn[1],     "m"    },
     {"stats-prntrop",   1,  (void *)&prcopt_.prn[2],     "m"    },
