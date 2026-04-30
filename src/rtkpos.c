@@ -561,31 +561,11 @@ static void udpos(rtk_t *rtk, double tt)
     }
     /* process noise added to only acceleration  P=P+Q
      *
-     * Two distinct models depending on whether the EKF interval
-     * [sol.time-tt, sol.time] is bracketed by loaded IMU samples:
-     *
-     *   covered:    Q[i,i] = prn_imu² · |dt| + ∫ a²(τ) dτ
-     *   not covered: Q[i,i] = prn_walk² · |dt|     (stock random-walk)
-     *
-     * The integral is the per-sample Σ aᵢ² · Δtᵢ from accel_prn_integrate
-     * (units m²/s³ — already includes Δt). The configured baseline
-     * prn_imu_acch/_accv enters as a measurement-noise-floor variance
-     * added in quadrature with the IMU signal's variance. */
-    {
-        gtime_t t_prev = timeadd(rtk->sol.time, -tt);
-        double qe2, qn2, qu2;
-        if (accel_prn_integrate(t_prev, rtk->sol.time, &qe2, &qn2, &qu2)) {
-            double base_h = SQR(rtk->opt.prn_imu_acch) * fabs(tt);
-            double base_v = SQR(rtk->opt.prn_imu_accv) * fabs(tt);
-            Q[0] = base_h + qe2;
-            Q[4] = base_h + qn2;
-            Q[8] = base_v + qu2;
-        }
-        else {
-            Q[0]=Q[4]=SQR(rtk->opt.prn[3])*fabs(tt);
-            Q[8]=     SQR(rtk->opt.prn[4])*fabs(tt);
-        }
-    }
+     * Pure random-walk-acceleration model — applied unconditionally. The
+     * IMU is fed in as a measurement update on the accel state (see
+     * udimu() called from relpos()), not as an additional Q term. */
+    Q[0]=Q[4]=SQR(rtk->opt.prn[3])*fabs(tt);
+    Q[8]=     SQR(rtk->opt.prn[4])*fabs(tt);
     ecef2pos(rtk->x,pos);
     covecef(pos,Q,Qv);
     for (i=0;i<3;i++) for (j=0;j<3;j++) {
@@ -982,6 +962,59 @@ static void udstate(rtk_t *rtk, const obsd_t *obs, const int *sat,
     if (rtk->opt.mode>PMODE_DGPS) {
         udbias(rtk,tt,obs,sat,iu,ir,ns,nav);
     }
+}
+/* IMU measurement update on the EKF acceleration state ----------------------
+* Loose-coupling: feed the time-weighted mean ENU acceleration over
+* [sol.time-tt, sol.time] as a 3-vector measurement of the EKF accel state.
+* H rotates ECEF accel cols (states 6..8) into ENU; R = diag(prn_imu_acch²,
+* prn_imu_acch², prn_imu_accv²). No-op when IMU coverage is missing,
+* dynamics is off, or rtk->tt is 0 (first epoch). */
+static void udimu(rtk_t *rtk)
+{
+    if (!rtk->opt.dynamics) return;
+    if (!accel_prn_loaded()) return;
+    if (rtk->tt == 0.0) return;
+
+    gtime_t t_prev = timeadd(rtk->sol.time, -rtk->tt);
+    double ze, zn, zu;
+    if (!accel_prn_mean(t_prev, rtk->sol.time, &ze, &zn, &zu)) return;
+
+    /* The accel-state cols of P must be initialised; udpos sets these up
+     * when dynamics is on, but bail defensively if not. */
+    int nx = rtk->nx;
+    if (rtk->P[6 + 6*nx] <= 0.0 || rtk->P[7 + 7*nx] <= 0.0 ||
+        rtk->P[8 + 8*nx] <= 0.0) return;
+
+    double pos[3]; ecef2pos(rtk->x, pos);
+    double E[9]; xyz2enu(pos, E);
+
+    /* H is nx × 3, column-major: H[state_idx + meas_idx * nx]. Only the
+     * 3 accel-state rows are non-zero; for measurement axis j (0=E,1=N,
+     * 2=U) and accel axis i (0,1,2 = ECEF x,y,z), the gradient is
+     * E[j + 3*i] (xyz2enu is column-major so E[j + 3*i] = ENU row j,
+     * ECEF col i). */
+    double *H = zeros(nx, 3);
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            H[(6+i) + j*nx] = E[j + 3*i];
+
+    /* Innovation: v = z - H_logical · x, where H_logical is the 3×3 ENU
+     * rotation applied to the accel-state slots. */
+    double v[3];
+    v[0] = ze - (E[0]*rtk->x[6] + E[3]*rtk->x[7] + E[6]*rtk->x[8]);
+    v[1] = zn - (E[1]*rtk->x[6] + E[4]*rtk->x[7] + E[7]*rtk->x[8]);
+    v[2] = zu - (E[2]*rtk->x[6] + E[5]*rtk->x[7] + E[8]*rtk->x[8]);
+
+    double R[9] = {0};
+    R[0] = SQR(rtk->opt.prn_imu_acch);
+    R[4] = SQR(rtk->opt.prn_imu_acch);
+    R[8] = SQR(rtk->opt.prn_imu_accv);
+
+    int info = filter(rtk->x, rtk->P, H, v, R, nx, 3);
+    if (info) {
+        trace(2, "udimu: filter error (info=%d)\n", info);
+    }
+    free(H);
 }
 /* UD (undifferenced) phase/code residual for satellite ----------------------*/
 static void zdres_sat(int base, double r, const obsd_t *obs, const nav_t *nav,
@@ -2275,6 +2308,8 @@ static int relpos(rtk_t *rtk, const obsd_t *obs, int nu, int nr,
     /* update kalman filter states (pos,vel,acc,ionosp, troposp, sat phase biases) */
     trace(4,"before udstate: x="); tracemat(4,rtk->x,1,NR(opt),13,4);
     udstate(rtk,obs,sat,iu,ir,ns,nav);
+    /* IMU measurement update on the accel state (no-op without coverage). */
+    udimu(rtk);
     trace(4,"after udstate x="); tracemat(4,rtk->x,1,NR(opt),13,4);
 
     for (i=0;i<ns;i++) for (j=0;j<nf;j++) {

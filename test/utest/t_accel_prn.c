@@ -7,22 +7,19 @@
 *      ../../src/accel_prn.c ../../src/rtkcmn.c ../../src/trace.c \
 *      -lm -o t_accel_prn
 *
-* Run:
-*   ./t_accel_prn   # exits 0 on pass, nonzero on first failure
-*
-* `accel_prn_integrate` returns Σᵢ aᵢ² · Δtᵢ per axis (m²/s³). It does
-* NOT include the configured baseline prn_imu² · dt; that part lives in
-* udpos. Tests therefore verify only the integral over CSV samples.
+* `accel_prn_mean` returns the time-weighted mean of (a_E, a_N, a_U) over
+* [t_lo, t_hi] (m/s²). udimu() in rtkpos.c uses this as a 3-vector
+* measurement of the EKF accel state in ENU.
 *
 * Tests covered:
-*   I1   single-sample window    → e²·dt etc.
-*   I2   multi-sample window     → sum of rectangles
-*   I3   zero-width interval     → integral = 0, returns covered
-*   I4   straddles first sample  → no coverage
-*   I5   straddles last sample   → no coverage
-*   I6   reversed argument order → same result
-*   I7   property test           → matches naive Riemann sum
-*   I8   trailing-column toleration
+*   M1   single-sample window    → returns the sample's value
+*   M2   multi-sample window     → time-weighted mean across samples
+*   M3   single sample, exact-time partial window → that sample's value
+*   M4   straddles first sample  → no coverage
+*   M5   straddles last sample   → no coverage
+*   M6   reversed argument order → same result
+*   M7   property test           → matches naive time-weighted mean
+*   M8   trailing-column toleration
 *   B1   frame identity at lat=0, lon=0
 *   B3   trace + symmetry invariance under ENU->ECEF rotation
 *-----------------------------------------------------------------------------*/
@@ -76,7 +73,7 @@ static char *write_csv(const double *offsets, int n,
     return path;
 }
 
-/* ---------- I1: single-sample window ----------------------------------- */
+/* ---------- M1: single-sample window ----------------------------------- */
 static void test_single_sample_window(void) {
     fprintf(stderr, "test_single_sample_window\n");
     double offsets[] = {0.0, 1.0, 2.0};
@@ -86,18 +83,17 @@ static void test_single_sample_window(void) {
     char *p = write_csv(offsets, 3, e, nn, u);
     accel_prn_load(p);
     gtime_t t0 = base_time();
-    double qe2, qn2, qu2;
-    int ok = accel_prn_integrate(timeadd(t0, 0.3), timeadd(t0, 0.7),
-                                 &qe2, &qn2, &qu2);
-    CHECK(ok == 1, "I1: should be covered");
-    /* Sample 0 covers [0, 1); we integrate [0.3, 0.7] inside it. */
-    CHECK_NEAR(qe2, e[0]*e[0]*0.4,  1e-9, "I1: qe² = e0²·0.4");
-    CHECK_NEAR(qn2, nn[0]*nn[0]*0.4, 1e-9, "I1: signed values squared OK");
-    CHECK_NEAR(qu2, u[0]*u[0]*0.4,  1e-9, "I1: qu² = u0²·0.4");
+    double ze, zn, zu;
+    /* [0.3, 0.7] entirely inside sample 0's [0,1) extent → mean = sample 0 */
+    int ok = accel_prn_mean(timeadd(t0, 0.3), timeadd(t0, 0.7), &ze, &zn, &zu);
+    CHECK(ok == 1, "M1: should be covered");
+    CHECK_NEAR(ze, e[0],  1e-9, "M1: mean ze = e0");
+    CHECK_NEAR(zn, nn[0], 1e-9, "M1: signed values pass through");
+    CHECK_NEAR(zu, u[0],  1e-9, "M1: mean zu = u0");
     accel_prn_free(); unlink(p);
 }
 
-/* ---------- I2: window spans multiple samples -------------------------- */
+/* ---------- M2: multi-sample window ------------------------------------ */
 static void test_multi_sample_window(void) {
     fprintf(stderr, "test_multi_sample_window\n");
     double offsets[] = {0.0, 1.0, 2.0};
@@ -107,21 +103,21 @@ static void test_multi_sample_window(void) {
     char *p = write_csv(offsets, 3, e, nn, u);
     accel_prn_load(p);
     gtime_t t0 = base_time();
-    double qe2, qn2, qu2;
-    int ok = accel_prn_integrate(timeadd(t0, 0.5), timeadd(t0, 1.8),
-                                 &qe2, &qn2, &qu2);
-    CHECK(ok == 1, "I2: should be covered");
-    /* sample 0: [0,1)→[0.5,1)=0.5; sample 1: [1,2)→[1,1.8)=0.8 */
-    double exp_e = e[0]*e[0]*0.5 + e[1]*e[1]*0.8;
-    double exp_n = nn[0]*nn[0]*0.5 + nn[1]*nn[1]*0.8;
-    double exp_u = u[0]*u[0]*0.5 + u[1]*u[1]*0.8;
-    CHECK_NEAR(qe2, exp_e, 1e-9, "I2: qe² across samples");
-    CHECK_NEAR(qn2, exp_n, 1e-9, "I2: qn² across samples");
-    CHECK_NEAR(qu2, exp_u, 1e-9, "I2: qu² across samples");
+    double ze, zn, zu;
+    /* [0.5, 1.8] → sample 0 covers [0.5,1)=0.5s, sample 1 covers [1,1.8)=0.8s */
+    int ok = accel_prn_mean(timeadd(t0, 0.5), timeadd(t0, 1.8), &ze, &zn, &zu);
+    CHECK(ok == 1, "M2: should be covered");
+    double dt = 1.3;
+    double exp_e = (e[0]*0.5 + e[1]*0.8) / dt;
+    double exp_n = (nn[0]*0.5 + nn[1]*0.8) / dt;
+    double exp_u = (u[0]*0.5 + u[1]*0.8) / dt;
+    CHECK_NEAR(ze, exp_e, 1e-9, "M2: time-weighted mean E");
+    CHECK_NEAR(zn, exp_n, 1e-9, "M2: time-weighted mean N");
+    CHECK_NEAR(zu, exp_u, 1e-9, "M2: time-weighted mean U");
     accel_prn_free(); unlink(p);
 }
 
-/* ---------- I3: zero-width interval ------------------------------------ */
+/* ---------- M3: zero-width interval is rejected (no measurement) ------- */
 static void test_zero_width(void) {
     fprintf(stderr, "test_zero_width\n");
     double offsets[] = {0.0, 1.0, 2.0};
@@ -131,17 +127,16 @@ static void test_zero_width(void) {
     char *p = write_csv(offsets, 3, e, nn, u);
     accel_prn_load(p);
     gtime_t t0 = base_time();
-    double qe2 = 999, qn2 = 999, qu2 = 999;
+    double ze = 999, zn = 999, zu = 999;
     gtime_t t = timeadd(t0, 0.5);
-    int ok = accel_prn_integrate(t, t, &qe2, &qn2, &qu2);
-    CHECK(ok == 1, "I3: zero-width covered");
-    CHECK_NEAR(qe2, 0.0, 0.0, "I3: qe² = 0 exactly");
-    CHECK_NEAR(qn2, 0.0, 0.0, "I3: qn² = 0 exactly");
-    CHECK_NEAR(qu2, 0.0, 0.0, "I3: qu² = 0 exactly");
+    int ok = accel_prn_mean(t, t, &ze, &zn, &zu);
+    CHECK(ok == 0, "M3: zero-width interval is not a valid measurement");
+    CHECK(ze == 999 && zn == 999 && zu == 999,
+          "M3: outputs untouched on zero-width");
     accel_prn_free(); unlink(p);
 }
 
-/* ---------- I4 / I5: straddle edges → no coverage ---------------------- */
+/* ---------- M4 / M5: straddle edges → no coverage ---------------------- */
 static void test_straddle_edges(void) {
     fprintf(stderr, "test_straddle_edges\n");
     double offsets[] = {1.0, 2.0, 3.0};
@@ -149,19 +144,16 @@ static void test_straddle_edges(void) {
     char *p = write_csv(offsets, 3, e, nn, u);
     accel_prn_load(p);
     gtime_t t0 = base_time();
-    double qe2 = 999, qn2 = 999, qu2 = 999;
-    int ok = accel_prn_integrate(timeadd(t0, -1.0), timeadd(t0, 2.0),
-                                 &qe2, &qn2, &qu2);
-    CHECK(ok == 0, "I4: straddles first sample → not covered");
-    CHECK(qe2 == 999 && qn2 == 999 && qu2 == 999,
-          "I4: outputs untouched on no-coverage");
-    ok = accel_prn_integrate(timeadd(t0, 2.5), timeadd(t0, 4.0),
-                             &qe2, &qn2, &qu2);
-    CHECK(ok == 0, "I5: straddles last sample → not covered");
+    double ze = 999, zn = 999, zu = 999;
+    int ok = accel_prn_mean(timeadd(t0, -1.0), timeadd(t0, 2.0), &ze, &zn, &zu);
+    CHECK(ok == 0, "M4: straddles first sample → no coverage");
+    CHECK(ze == 999, "M4: outputs untouched");
+    ok = accel_prn_mean(timeadd(t0, 2.5), timeadd(t0, 4.0), &ze, &zn, &zu);
+    CHECK(ok == 0, "M5: straddles last sample → no coverage");
     accel_prn_free(); unlink(p);
 }
 
-/* ---------- I6: reversed args ------------------------------------------ */
+/* ---------- M6: reversed args ------------------------------------------ */
 static void test_reversed_args(void) {
     fprintf(stderr, "test_reversed_args\n");
     double offsets[] = {0.0, 1.0, 2.0};
@@ -170,31 +162,29 @@ static void test_reversed_args(void) {
     char *p = write_csv(offsets, 3, e, nn, u);
     accel_prn_load(p);
     gtime_t t0 = base_time();
-    double qe_f, qn_f, qu_f, qe_r, qn_r, qu_r;
-    accel_prn_integrate(timeadd(t0, 0.5), timeadd(t0, 1.8),
-                        &qe_f, &qn_f, &qu_f);
-    accel_prn_integrate(timeadd(t0, 1.8), timeadd(t0, 0.5),
-                        &qe_r, &qn_r, &qu_r);
-    CHECK_NEAR(qe_f, qe_r, 1e-12, "I6: arg-order invariance");
-    CHECK_NEAR(qn_f, qn_r, 1e-12, "I6: arg-order invariance");
-    CHECK_NEAR(qu_f, qu_r, 1e-12, "I6: arg-order invariance");
+    double ze_f, zn_f, zu_f, ze_r, zn_r, zu_r;
+    accel_prn_mean(timeadd(t0, 0.5), timeadd(t0, 1.8), &ze_f, &zn_f, &zu_f);
+    accel_prn_mean(timeadd(t0, 1.8), timeadd(t0, 0.5), &ze_r, &zn_r, &zu_r);
+    CHECK_NEAR(ze_f, ze_r, 1e-12, "M6: arg-order invariance E");
+    CHECK_NEAR(zn_f, zn_r, 1e-12, "M6: arg-order invariance N");
+    CHECK_NEAR(zu_f, zu_r, 1e-12, "M6: arg-order invariance U");
     accel_prn_free(); unlink(p);
 }
 
-/* ---------- I7: property test against naive Riemann sum ---------------- */
-static double naive_integrate_axis(const double *offsets, const double *vals,
-                                   int n, double t_lo, double t_hi) {
-    double sum = 0.0;
+/* ---------- M7: property test against naive time-weighted mean --------- */
+static double naive_mean_axis(const double *offsets, const double *vals,
+                              int n, double t_lo, double t_hi) {
+    double num = 0.0, dt_total = t_hi - t_lo;
     for (int i = 0; i < n - 1; i++) {
         double left  = offsets[i]   > t_lo ? offsets[i]   : t_lo;
         double right = offsets[i+1] < t_hi ? offsets[i+1] : t_hi;
-        if (right > left) sum += vals[i] * vals[i] * (right - left);
+        if (right > left) num += vals[i] * (right - left);
     }
-    return sum;
+    return num / dt_total;
 }
 
-static void test_integrate_property(void) {
-    fprintf(stderr, "test_integrate_property\n");
+static void test_mean_property(void) {
+    fprintf(stderr, "test_mean_property\n");
     const int N = 500;
     const int Q = 200;
     double *offsets = malloc(sizeof(double)*N);
@@ -206,7 +196,7 @@ static void test_integrate_property(void) {
     for (int i = 0; i < N; i++) {
         cur += 0.05 + (rand()/(double)RAND_MAX) * 0.5;
         offsets[i] = cur;
-        e[i]  = -10.0 + (rand()/(double)RAND_MAX) * 20.0;  /* signed */
+        e[i]  = -10.0 + (rand()/(double)RAND_MAX) * 20.0;
         nn[i] = -10.0 + (rand()/(double)RAND_MAX) * 20.0;
         u[i]  = -10.0 + (rand()/(double)RAND_MAX) * 20.0;
     }
@@ -215,34 +205,35 @@ static void test_integrate_property(void) {
     gtime_t t0 = base_time();
 
     int mismatches = 0;
-    double t_first = offsets[0];
-    double t_last  = offsets[N-1];
+    double t_first = offsets[0], t_last = offsets[N-1];
     for (int q = 0; q < Q; q++) {
         double a = t_first + (rand()/(double)RAND_MAX) * (t_last - t_first - 0.001);
         double b = a + 0.001 + (rand()/(double)RAND_MAX) * (t_last - a - 0.001);
         if (b > t_last) b = t_last;
-        double qe2, qn2, qu2;
-        int ok = accel_prn_integrate(timeadd(t0, a), timeadd(t0, b),
-                                     &qe2, &qn2, &qu2);
+        double ze, zn, zu;
+        int ok = accel_prn_mean(timeadd(t0, a), timeadd(t0, b), &ze, &zn, &zu);
         if (!ok) { mismatches++; continue; }
-        double ee = naive_integrate_axis(offsets, e,  N, a, b);
-        double nx = naive_integrate_axis(offsets, nn, N, a, b);
-        double uu = naive_integrate_axis(offsets, u,  N, a, b);
-        double rtol = 1e-7;
-        if (fabs(qe2 - ee) > rtol*fabs(ee) + 1e-9 ||
-            fabs(qn2 - nx) > rtol*fabs(nx) + 1e-9 ||
-            fabs(qu2 - uu) > rtol*fabs(uu) + 1e-9) {
+        double exp_e = naive_mean_axis(offsets, e,  N, a, b);
+        double exp_n = naive_mean_axis(offsets, nn, N, a, b);
+        double exp_u = naive_mean_axis(offsets, u,  N, a, b);
+        /* Mean involves Σa·Δt / dt; the dt cancellation is not exact
+           after the gtime_t round-trip, so allow a generous absolute
+           floor on top of the relative tolerance. */
+        double rtol = 1e-7, atol = 1e-7;
+        if (fabs(ze - exp_e) > rtol*fabs(exp_e) + atol ||
+            fabs(zn - exp_n) > rtol*fabs(exp_n) + atol ||
+            fabs(zu - exp_u) > rtol*fabs(exp_u) + atol) {
             mismatches++;
-            fprintf(stderr, "  q=%d a=%.6f b=%.6f qe²=%.6f exp=%.6f rel=%.2e\n",
-                    q, a, b, qe2, ee, fabs(qe2-ee)/fmax(fabs(ee),1e-12));
+            fprintf(stderr, "  q=%d a=%.6f b=%.6f ze=%.6f exp=%.6f\n",
+                    q, a, b, ze, exp_e);
         }
     }
-    CHECK(mismatches == 0, "I7: integrator must match naive Riemann sum");
+    CHECK(mismatches == 0, "M7: time-weighted mean must match naive");
     free(offsets); free(e); free(nn); free(u);
     accel_prn_free(); unlink(p);
 }
 
-/* ---------- I8: trailing column toleration ---------------------------- */
+/* ---------- M8: trailing column toleration ---------------------------- */
 static void test_trailing_columns(void) {
     fprintf(stderr, "test_trailing_columns\n");
     char tmp[64];
@@ -259,13 +250,12 @@ static void test_trailing_columns(void) {
     }
     fclose(fp);
     int n = accel_prn_load(tmp);
-    CHECK(n == 3, "I8: 5-column CSV loads (extra column ignored)");
-    double qe2, qn2, qu2;
-    int ok = accel_prn_integrate(timeadd(t0, 0.5), timeadd(t0, 1.5),
-                                 &qe2, &qn2, &qu2);
-    CHECK(ok == 1 && fabs(qe2 - 1.0) < 1e-9 && fabs(qn2 - 4.0) < 1e-9
-                  && fabs(qu2 - 9.0) < 1e-9,
-          "I8: integration uses parsed values; trailing col ignored");
+    CHECK(n == 3, "M8: 5-column CSV loads (extra column ignored)");
+    double ze, zn, zu;
+    int ok = accel_prn_mean(timeadd(t0, 0.5), timeadd(t0, 1.5), &ze, &zn, &zu);
+    CHECK(ok == 1 && fabs(ze - 1.0) < 1e-9 && fabs(zn - 2.0) < 1e-9
+                  && fabs(zu - 3.0) < 1e-9,
+          "M8: mean of constant samples = sample value");
     accel_prn_free(); unlink(tmp);
 }
 
@@ -321,7 +311,7 @@ int main(void) {
     test_zero_width();
     test_straddle_edges();
     test_reversed_args();
-    test_integrate_property();
+    test_mean_property();
     test_trailing_columns();
     test_frame_at_origin();
     test_trace_invariance();

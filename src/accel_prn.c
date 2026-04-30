@@ -113,8 +113,8 @@ int accel_prn_load(const char *path) {
 
 int accel_prn_loaded(void) { return g_n > 0; }
 
-int accel_prn_integrate(gtime_t t_lo_in, gtime_t t_hi_in,
-                        double *qe2, double *qn2, double *qu2) {
+int accel_prn_mean(gtime_t t_lo_in, gtime_t t_hi_in,
+                   double *ze, double *zn, double *zu) {
     if (g_n == 0) return 0;
     if (t_lo_in.time == 0 || t_hi_in.time == 0) return 0;
 
@@ -123,17 +123,11 @@ int accel_prn_integrate(gtime_t t_lo_in, gtime_t t_hi_in,
         gtime_t tmp = t_lo; t_lo = t_hi; t_hi = tmp;
     }
 
-    /* Strict coverage. See header for rationale. */
     if (timediff(t_lo, g_samples[0].t)     < 0.0) return 0;
     if (timediff(t_hi, g_samples[g_n-1].t) > 0.0) return 0;
 
-    /* Zero-width interval: integral is zero exactly. Treat as covered so
-     * the caller still adds its own config²·dt term (which is also zero
-     * when dt is 0). */
-    if (timediff(t_hi, t_lo) == 0.0) {
-        *qe2 = *qn2 = *qu2 = 0.0;
-        return 1;
-    }
+    double dt_total = timediff(t_hi, t_lo);
+    if (dt_total <= 0.0) return 0;  /* no measurement to extract */
 
     int i_start = find_idx(t_lo);
     int i_end   = find_idx(t_hi);
@@ -147,13 +141,13 @@ int accel_prn_integrate(gtime_t t_lo_in, gtime_t t_hi_in,
                           ? g_samples[i+1].t : t_hi;
         double dt = timediff(right, left);
         if (dt <= 0.0) continue;
-        sum_e += g_samples[i].ae * g_samples[i].ae * dt;
-        sum_n += g_samples[i].an * g_samples[i].an * dt;
-        sum_u += g_samples[i].au * g_samples[i].au * dt;
+        sum_e += g_samples[i].ae * dt;
+        sum_n += g_samples[i].an * dt;
+        sum_u += g_samples[i].au * dt;
     }
-    *qe2 = sum_e;
-    *qn2 = sum_n;
-    *qu2 = sum_u;
+    *ze = sum_e / dt_total;
+    *zn = sum_n / dt_total;
+    *zu = sum_u / dt_total;
     return 1;
 }
 
