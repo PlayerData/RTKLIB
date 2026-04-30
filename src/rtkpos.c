@@ -1347,7 +1347,18 @@ static int ddres_dopobs(rtk_t *rtk, const obsd_t *obs, const double *x,
             double dd_pred = (prate_ru - prate_rb) - (prate_ju - prate_jb);
             v[nv] = dd_meas - dd_pred;
 
-            /* design matrix row: partials wrt rover velocity x[3..5] */
+            /* Design matrix row: partials wrt rover velocity x[3..5].
+             *
+             * Same sign convention as the phase/code DD elsewhere in this
+             * file: RTKLIB's H[k] is ∂(predicted_measurement)/∂x[k], not
+             * ∂(residual)/∂x[k]. The Kalman update is xp = x + K·v
+             * (filter() in rtkcmn.c), and that equation requires H to be
+             * the partial of the *predicted* measurement, not the residual.
+             *
+             * Predicted DD range-rate = (rrate_ru - rrate_rb) - (rrate_ju - rrate_jb)
+             * with rrate = e·(v_sat - v_rover) → partial wrt v_rover is -e.
+             * So DD partial = -e_ru + e_ju (rover-side terms only; base is static).
+             */
             if (H) {
                 Hi = H + nv * rtk->nx;
                 for (k = 0; k < rtk->nx; k++) Hi[k] = 0.0;

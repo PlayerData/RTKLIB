@@ -125,6 +125,11 @@ void utest1_static_zero_residual(void) {
 
     /* iref = sat 0, non-ref = sat 1.
      * H row: position partials zero; velocity partials = -e_ref + e_other.
+     * Same sign convention as RTKLIB's phase/code DD: H[k] is the partial
+     * of the *predicted* measurement wrt state (not the residual). The
+     * Kalman update is xp = x + K·v with v = measured - predicted, so K·v
+     * pushes the state in the right direction for either sign convention
+     * provided H matches the convention.
      * H accel partials zero. */
     printf("  H[0..8]=");
     for (int i = 0; i < 9; i++) printf("%.4f ", H[i]);
@@ -348,7 +353,7 @@ void utest4_rover_velocity_wrong_prediction(void) {
     assert(nv == 1);
     assert(fabs(v[0] - expected) < 0.05);
 
-    /* H[3..5] should be -e_ref + e_other */
+    /* H[3..5] should be -e_ref + e_other (RTKLIB H is ∂h/∂x, not ∂v/∂x). */
     assert(fabs(H[3] - (-e[0*3+0] + e[1*3+0])) < 1e-9);
     assert(fabs(H[4] - (-e[0*3+1] + e[1*3+1])) < 1e-9);
     assert(fabs(H[5] - (-e[0*3+2] + e[1*3+2])) < 1e-9);
@@ -356,11 +361,111 @@ void utest4_rover_velocity_wrong_prediction(void) {
     printf("utest4 OK\n\n");
 }
 
+/* Critical test: the H matrix sign must drive the EKF state in the
+ * direction that REDUCES the residual, not increases it. If we have a
+ * residual v from velocity error δv, then applying a small velocity
+ * correction in the direction H'·v should produce a smaller |v|.
+ *
+ * This catches the most likely class of bug — a sign flip in the H
+ * partials — that would otherwise pass numeric-magnitude assertions.
+ *
+ * Concretely: sets up rover with TRUE velocity (10, 0, 0). Filter state
+ * starts at v=(0,0,0). Computes residual v_old, applies a small step
+ * α·H[3..5]·v_old to the state velocity, then re-runs the function. The
+ * residual should DECREASE if H has the right sign. */
+void utest5_h_sign_drives_state_toward_truth(void) {
+    rtk_t rtk;
+    init_rtk(&rtk, 0, 1000, 0);
+
+    int ns = 2;
+    int sat[2] = {1, 2};
+    int iu[2] = {0, 1};
+    int ir[2] = {2, 3};
+
+    double v_actual[3] = {10, 0, 0};
+
+    double rs[4*6] = {0}, dts[4*2] = {0};
+    put_sat(rs, dts, 0,  3000000, 0, 19000000, 1e-9, 0, 0, 0, 0);
+    put_sat(rs, dts, 1, -3000000, 0, 19000000, 1e-9, 0, 0, 0, 0);
+    put_sat(rs, dts, 2,  3000000, 0, 19000000, 1e-9, 0, 0, 0, 0);
+    put_sat(rs, dts, 3, -3000000, 0, 19000000, 1e-9, 0, 0, 0, 0);
+
+    double rover[3] = {0, 0, 0};
+    double base[3]  = {0, 1000, 0};
+    double e[4*3] = {0};
+    put_los(e, 0, rs, rover);
+    put_los(e, 1, rs, rover);
+    put_los(e, 2, rs, base);
+    put_los(e, 3, rs, base);
+
+    double rate0 = -(e[0*3+0]*v_actual[0] + e[0*3+1]*v_actual[1] + e[0*3+2]*v_actual[2]);
+    double rate1 = -(e[1*3+0]*v_actual[0] + e[1*3+1]*v_actual[1] + e[1*3+2]*v_actual[2]);
+    double D0 = -rate0 * FREQL1/CLIGHT;
+    double D1 = -rate1 * FREQL1/CLIGHT;
+
+    obsd_t obs[4];
+    memset(obs, 0, sizeof(obs));
+    obs[0].sat = 1; obs[0].D[0] = (float)D0;
+    obs[1].sat = 2; obs[1].D[0] = (float)D1;
+    obs[2].sat = 1; obs[2].D[0] = 1e-9f;
+    obs[3].sat = 2; obs[3].D[0] = 1e-9f;
+
+    double azel[4*2] = {0, 1.5, 0, 1.4, 0, 1.5, 0, 1.4};
+    double freq[4*1] = {FREQL1, FREQL1, FREQL1, FREQL1};
+
+    /* state starts with WRONG velocity */
+    double x[9] = {0, 0, 0,  0, 0, 0,  0, 0, 0};
+
+    double v[8] = {0}, H[9*8] = {0}, Ri[8] = {0}, Rj[8] = {0};
+    int vflg[8] = {0}, nb[10] = {0}, b = 0;
+
+    int nv = test_ddres_dopobs(&rtk, obs, x, sat, e, azel, freq, iu, ir,
+                               ns, rs, dts, v, H, Ri, Rj, vflg, nb, &b, 0);
+    assert(nv == 1);
+    double v_old = v[0];
+    double Hx_old = H[3], Hy_old = H[4], Hz_old = H[5];
+
+    /* Apply a small step in the direction the EKF would update.
+     *
+     * RTKLIB's filter() in rtkcmn.c stores H as ∂(predicted_meas)/∂x
+     * (NOT ∂(residual)/∂x), and applies xp = x + K·v with
+     * K = P·H·(H'PH + R)^{-1} and v = measured - predicted.
+     *
+     * For our 1-observation case, K ∝ P·H, so δx ∝ +H·v. With the RTKLIB
+     * H sign convention (h-partial), the residual v decreases when we
+     * step in the +H·v direction.
+     *
+     * Note: a naive textbook "δx = -∂h/∂x · residual" approach would have
+     * the opposite sign. The convention difference matters; this test
+     * pins the RTKLIB convention. */
+    double scale = 0.01;  /* small step to stay near linearisation */
+    double dvx = scale * Hx_old * v_old;
+    double dvy = scale * Hy_old * v_old;
+    double dvz = scale * Hz_old * v_old;
+    x[3] += dvx;
+    x[4] += dvy;
+    x[5] += dvz;
+
+    /* re-run with updated state */
+    double v2[8] = {0}, H2[9*8] = {0}, Ri2[8] = {0}, Rj2[8] = {0};
+    int vflg2[8] = {0}, nb2[10] = {0}, b2 = 0;
+    nv = test_ddres_dopobs(&rtk, obs, x, sat, e, azel, freq, iu, ir,
+                           ns, rs, dts, v2, H2, Ri2, Rj2, vflg2, nb2, &b2, 0);
+
+    printf("utest5: v_old=%.6f, v_new=%.6f (after dv=(%.4f,%.4f,%.4f))\n",
+           v_old, v2[0], dvx, dvy, dvz);
+    printf("        |v_new| should be < |v_old| if H sign is correct\n");
+    assert(fabs(v2[0]) < fabs(v_old));
+
+    printf("utest5 OK\n\n");
+}
+
 int main(void) {
     utest1_static_zero_residual();
     utest2_radial_sat_velocity_no_residual();
     utest3_rover_velocity_correct_prediction();
     utest4_rover_velocity_wrong_prediction();
+    utest5_h_sign_drives_state_toward_truth();
     printf("all tests passed\n");
     return 0;
 }
