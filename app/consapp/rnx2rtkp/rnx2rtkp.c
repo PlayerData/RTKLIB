@@ -19,6 +19,7 @@
 *-----------------------------------------------------------------------------*/
 #include <stdarg.h>
 #include "rtklib.h"
+#include "accel_prn.h"
 
 #define PROGNAME    "rnx2rtkp"          /* program name */
 #define MAXFILE     16                  /* max number of input files */
@@ -73,6 +74,11 @@ static const char *help[]={
 "           rover latitude/longitude/height for fixed or ppp-fixed mode",
 " -y level  output solution status (0:off,1:states,2:residuals) [0]",
 " -x level  debug trace level (0:off) [0]",
+" -pn file  CSV of measured accel process-noise per epoch [off]",
+"           columns: time,prn_e,prn_n,prn_u (m/s^2, local ENU). time is",
+"           ISO8601 interpreted as GPST. must be strictly increasing.",
+"           epochs outside the covered range fall back to the isotropic",
+"           h/v config prn[3..4].",
 " --rover list rover names for processing, separated by a space",
 " --base list  base names for processing, separated by a space",
 " --version display release version",
@@ -106,6 +112,7 @@ int main(int argc, char **argv)
     int i,j,n,ret;
     const char *infile[MAXFILE],*outfile="",*p;
     const char *rover = "", *base = "";
+    const char *accel_prn_file = "";
 
     prcopt.mode  =PMODE_KINEMA;
     prcopt.navsys=0;
@@ -185,6 +192,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"--base")&&i+1<argc) base=argv[++i];
         else if (!strcmp(argv[i],"-y")&&i+1<argc) solopt.sstat=atoi(argv[++i]);
         else if (!strcmp(argv[i],"-x")&&i+1<argc) solopt.trace=atoi(argv[++i]);
+        else if (!strcmp(argv[i],"-pn")&&i+1<argc) accel_prn_file=argv[++i];
         else if (!strcmp(argv[i], "--version")) {
             fprintf(stderr, "rnx2rtkp RTKLIB %s %s\n", VER_RTKLIB, PATCH_LEVEL);
             exit(0);
@@ -205,7 +213,11 @@ int main(int argc, char **argv)
         traceopen(filopt.trace);
         tracelevel(solopt.trace);
     }
+    accel_prn_load(accel_prn_file);
+
     ret=postpos(ts,te,tint,0.0,&prcopt,&solopt,&filopt,infile,n,outfile,rover,base);
+
+    accel_prn_free();
 
     if (!ret) fprintf(stderr,"%40s\r","");
     return ret?EXIT_FAILURE:0;

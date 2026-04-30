@@ -49,6 +49,7 @@
 *-----------------------------------------------------------------------------*/
 #include <stdarg.h>
 #include "rtklib.h"
+#include "accel_prn.h"
 
 /* algorithm configuration -------------------------------------------------- */
 #define STD_PREC_VAR_THRESH 0  /* pos variance threshold to skip standard precision */
@@ -559,8 +560,24 @@ static void udpos(rtk_t *rtk, double tt)
         }
     }
     /* process noise added to only acceleration  P=P+Q */
-    Q[0]=Q[4]=SQR(rtk->opt.prn[3])*fabs(tt);
-    Q[8]=SQR(rtk->opt.prn[4])*fabs(tt);
+    {
+        /* The previous-epoch time is sol.time - tt: rtk->tt was just set as
+         * timediff(new, prev) at rtkpos.c entry. Range-integrate over the
+         * actual interval so high-rate IMU samples are summed correctly
+         * regardless of GNSS / IMU rate. */
+        gtime_t t_prev = timeadd(rtk->sol.time, -tt);
+        double qe, qn, qu;
+        if (accel_prn_integrate(t_prev, rtk->sol.time, &qe, &qn, &qu)) {
+            /* qe/qn/qu already include the dt factor (units m^2/s^3). */
+            Q[0]=qe;
+            Q[4]=qn;
+            Q[8]=qu;
+        }
+        else {
+            Q[0]=Q[4]=SQR(rtk->opt.prn[3])*fabs(tt);
+            Q[8]=SQR(rtk->opt.prn[4])*fabs(tt);
+        }
+    }
     ecef2pos(rtk->x,pos);
     covecef(pos,Q,Qv);
     for (i=0;i<3;i++) for (j=0;j<3;j++) {
@@ -932,7 +949,7 @@ static void udstate(rtk_t *rtk, const obsd_t *obs, const int *sat,
                     const int *iu, const int *ir, int ns, const nav_t *nav)
 {
     trace(3,"udstate : ns=%d\n",ns);
-    
+
     double tt=rtk->tt;
 
     /* Temporal update of position/velocity/acceleration */
