@@ -1374,10 +1374,16 @@ static int ddres_dopobs(rtk_t *rtk, const obsd_t *obs, const double *x,
                 continue;
             }
 
+            /* Per-DD variance: the SD (single-difference rover-base) noise
+             * is sqrt(2) times the per-obs noise since rover and base
+             * Doppler measurements are independent. Mirroring varerr() in
+             * this file, which has `var = 2.0 * (...)` baked into the
+             * SD-equivalent it returns. Without this doubling, the EKF
+             * over-trusts Doppler observations by 2x in variance space. */
             double sig_i = dop_err * CLIGHT/freqi;
             double sig_j = dop_err * CLIGHT/freqj;
-            Ri[nv] = sig_i*sig_i;
-            Rj[nv] = sig_j*sig_j;
+            Ri[nv] = 2.0 * sig_i*sig_i;
+            Rj[nv] = 2.0 * sig_j*sig_j;
 
             vflg[nv++] = (sat[iref]<<16) | (sat[j]<<8) | (2<<4);
             nb[*b]++;
