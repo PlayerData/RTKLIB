@@ -1088,6 +1088,7 @@ typedef struct {        /* processing options type */
     int  freqopt;       /* disable L2-AR */
     char pppopt[256];   /* ppp option */
     int  dopobs;        /* use doppler obs in kinematic EKF (0:off,1:on) */
+    double maxinno_dop; /* reject threshold of doppler-DD innovation (m/s) */
 } prcopt_t;
 
 typedef struct {        /* solution options type */

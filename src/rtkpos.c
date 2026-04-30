@@ -1367,8 +1367,8 @@ static int ddres_dopobs(rtk_t *rtk, const obsd_t *obs, const double *x,
                 Hi[5] = -eru[2] + eju[2];
             }
 
-            /* outlier gate using maxinno[1] (code gate stand-in). */
-            if (fabs(v[nv]) > opt->maxinno[1]) {
+            double dop_gate = opt->maxinno_dop > 0.0 ? opt->maxinno_dop : 5.0;
+            if (fabs(v[nv]) > dop_gate) {
                 errmsg(rtk,"outlier rejected (sat=%3d-%3d D%d v=%.3f)\n",
                        sat[iref], sat[j], 1, v[nv]);
                 continue;
