@@ -1,6 +1,8 @@
 *.out
+*.dSYM
 t_atmos
 t_coord
+t_dopobs
 t_geoid
 t_gloeph
 t_ionex

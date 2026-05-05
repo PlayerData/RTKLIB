@@ -121,6 +121,8 @@ EXPORT opt_t sysopts[]={
     {"pos2-niter",      0,  (void *)&prcopt_.niter,      ""     },
     {"pos2-baselen",    1,  (void *)&prcopt_.baseline[0],"m"    },
     {"pos2-basesig",    1,  (void *)&prcopt_.baseline[1],"m"    },
+    {"pos2-dopobs",     3,  (void *)&prcopt_.dopobs,     SWTOPT },
+    {"pos2-rejdop",     1,  (void *)&prcopt_.maxinno_dop,"m/s"  },
     
     {"out-solformat",   3,  (void *)&solopt_.posf,       SOLOPT },
     {"out-outhead",     3,  (void *)&solopt_.outhead,    SWTOPT },

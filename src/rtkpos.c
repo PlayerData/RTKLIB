@@ -1211,15 +1211,212 @@ static int test_sys(int sys, int m)
         O H = linearized translation from innovations to states (az/el to sats)
         O R = measurement error covariances
         O vflg = bit encoded list of sats used for each double diff  */
+
+/* Doppler-DD measurement update (helper for ddres).
+ *
+ * Builds double-differenced range-rate observations from rover/base Doppler
+ * and appends them to the (v, H, Ri, Rj, vflg) measurement arrays. Each
+ * appended row constrains the velocity states x[3..5] (requires
+ * dynamics=on); position states see zero in their H entries.
+ *
+ * Math:
+ *   measured range-rate (m/s)    = -D · c/f                     [pntpos sign convention]
+ *   single-difference SD_S       = rrate_rover_S - rrate_base_S
+ *   double-difference DD         = SD_S - SD_T   (S = ref sat, T = other sat)
+ *   predicted range-rate         = e_R_S · (v_sat_S - v_R)
+ *                                  + earth_rotation_correction(R, S)
+ *                                  - c · sat_clock_drift_S
+ *   v[nv]                        = DD_measured - DD_predicted
+ *   H_partial wrt v_rover[k]     = -e_rover_S[k] + e_rover_T[k]
+ *
+ * Receiver clock drifts cancel in DD (same offset on both sats from each rcv).
+ * Sat clock drifts cancel in DD (same offset on rover and base for each sat).
+ *
+ * Caller responsibilities:
+ *   - x[3..5] holds rover ECEF velocity (requires dynamics=on)
+ *   - rs is the merged-obs sat positions+velocities (6 doubles per obs slot)
+ *     populated by satposs() with the merged rover+base obs array
+ *   - dts is the merged-obs sat clock+drift (2 doubles per obs slot)
+ *   - e is the merged-obs LOS unit vectors (3 doubles per obs slot)
+ *     populated by separate zdres() calls for rover then base
+ *   - iu[k] indexes into the rover portion of obs/rs/dts/e (0..nu-1)
+ *   - ir[k] indexes into the base portion (nu..nu+nr-1)
+ *   - All output arrays (v, H, Ri, Rj, vflg, nb) must have headroom for
+ *     up to ns extra rows total + NSYS extra group slots in nb.
+ *
+ * Returns the new nv (incremented past the doppler rows that survived
+ * gating). Updates *b to point past any new groups added to nb.
+ */
+/* extern wrapper for unit testing. The static variant keeps the symbol
+ * file-local for the production build; the wrapper is only referenced from
+ * test/utest/t_dopobs.c. */
+extern int test_ddres_dopobs(rtk_t *rtk, const obsd_t *obs, const double *x,
+                             const int *sat, const double *e, const double *azel,
+                             const double *freq, const int *iu, const int *ir,
+                             int ns, const double *rs, const double *dts,
+                             double *v, double *H, double *Ri, double *Rj,
+                             int *vflg, int *nb, int *b, int nv);
+
+static int ddres_dopobs(rtk_t *rtk, const obsd_t *obs, const double *x,
+                        const int *sat, const double *e, const double *azel,
+                        const double *freq, const int *iu, const int *ir,
+                        int ns, const double *rs, const double *dts,
+                        double *v, double *H, double *Ri, double *Rj,
+                        int *vflg, int *nb, int *b, int nv)
+{
+    prcopt_t *opt = &rtk->opt;
+    int nf = NF(opt);
+    int j, k, m;
+    double *Hi = NULL;
+    double freqi, freqj;
+    double v_rover[3] = {x[3], x[4], x[5]};
+    double v_base[3]  = {0.0, 0.0, 0.0};
+    double dop_err = opt->err[4] > 0.0 ? opt->err[4] : 1.0;  /* Hz */
+
+    for (m = 0; m < 6; m++) {
+        /* find ref sat (highest elevation, valid doppler) for this system */
+        int iref = -1;
+        for (j = 0; j < ns; j++) {
+            int sysi = rtk->ssat[sat[j]-1].sys;
+            if (!test_sys(sysi, m) || sysi == SYS_SBS) continue;
+            if (obs[iu[j]].D[0] == 0.0 || obs[ir[j]].D[0] == 0.0) continue;
+            if (freq[iu[j]*nf] <= 0.0) continue;
+            if (norm(rs + 3 + iu[j]*6, 3) <= 0.0) continue;
+            if (iref < 0 || azel[1+iu[j]*2] >= azel[1+iu[iref]*2]) iref = j;
+        }
+        if (iref < 0) continue;
+
+        for (j = 0; j < ns; j++) {
+            if (j == iref) continue;
+            int sysj = rtk->ssat[sat[j]-1].sys;
+            if (!test_sys(sysj, m)) continue;
+            if (obs[iu[j]].D[0] == 0.0 || obs[ir[j]].D[0] == 0.0) continue;
+            if (freq[iu[j]*nf] <= 0.0) continue;
+            if (norm(rs + 3 + iu[j]*6, 3) <= 0.0) continue;
+
+            freqi = freq[iu[iref]*nf];
+            freqj = freq[iu[j]*nf];
+
+            /* sat positions+velocities indexed by rover side and base side
+             * separately — they're computed at different signal-arrival
+             * times, so the earth-rotation correction has to use the right
+             * one for each receiver. */
+            const double *rsr_u = rs + iu[iref]*6;  /* ref sat at rover arrival */
+            const double *rsj_u = rs + iu[j]*6;     /* other sat at rover arrival */
+            const double *rsr_b = rs + ir[iref]*6;  /* ref sat at base arrival */
+            const double *rsj_b = rs + ir[j]*6;     /* other sat at base arrival */
+
+            /* measured range-rate (m/s) for each (rcv, sat) */
+            double rrate_ru = -obs[iu[iref]].D[0] * CLIGHT/freqi;
+            double rrate_rb = -obs[ir[iref]].D[0] * CLIGHT/freqi;
+            double rrate_ju = -obs[iu[j]].D[0]    * CLIGHT/freqj;
+            double rrate_jb = -obs[ir[j]].D[0]    * CLIGHT/freqj;
+
+            /* relative satellite velocity vs each rcv */
+            double dvr_u[3] = {rsr_u[3]-v_rover[0], rsr_u[4]-v_rover[1], rsr_u[5]-v_rover[2]};
+            double dvj_u[3] = {rsj_u[3]-v_rover[0], rsj_u[4]-v_rover[1], rsj_u[5]-v_rover[2]};
+            double dvr_b[3] = {rsr_b[3]-v_base[0],  rsr_b[4]-v_base[1],  rsr_b[5]-v_base[2]};
+            double dvj_b[3] = {rsj_b[3]-v_base[0],  rsj_b[4]-v_base[1],  rsj_b[5]-v_base[2]};
+
+            /* LOS unit vectors */
+            const double *eru = e + iu[iref]*3;
+            const double *eju = e + iu[j]*3;
+            const double *erb = e + ir[iref]*3;
+            const double *ejb = e + ir[j]*3;
+
+            /* predicted range-rates (m/s). Earth rotation term mirrors
+             * pntpos::resdop. dts[1+...] is sat clock drift (s/s). */
+            double prate_ru = dot3(dvr_u, eru)
+                + OMGE/CLIGHT*(rsr_u[4]*x[0] + rsr_u[1]*v_rover[0]
+                              -rsr_u[3]*x[1] - rsr_u[0]*v_rover[1])
+                - CLIGHT*dts[1+iu[iref]*2];
+            double prate_ju = dot3(dvj_u, eju)
+                + OMGE/CLIGHT*(rsj_u[4]*x[0] + rsj_u[1]*v_rover[0]
+                              -rsj_u[3]*x[1] - rsj_u[0]*v_rover[1])
+                - CLIGHT*dts[1+iu[j]*2];
+            double prate_rb = dot3(dvr_b, erb)
+                + OMGE/CLIGHT*(rsr_b[4]*rtk->rb[0] + rsr_b[1]*v_base[0]
+                              -rsr_b[3]*rtk->rb[1] - rsr_b[0]*v_base[1])
+                - CLIGHT*dts[1+ir[iref]*2];
+            double prate_jb = dot3(dvj_b, ejb)
+                + OMGE/CLIGHT*(rsj_b[4]*rtk->rb[0] + rsj_b[1]*v_base[0]
+                              -rsj_b[3]*rtk->rb[1] - rsj_b[0]*v_base[1])
+                - CLIGHT*dts[1+ir[j]*2];
+
+            double dd_meas = (rrate_ru - rrate_rb) - (rrate_ju - rrate_jb);
+            double dd_pred = (prate_ru - prate_rb) - (prate_ju - prate_jb);
+            v[nv] = dd_meas - dd_pred;
+
+            /* Design matrix row: partials wrt rover velocity x[3..5].
+             *
+             * Same sign convention as the phase/code DD elsewhere in this
+             * file: RTKLIB's H[k] is ∂(predicted_measurement)/∂x[k], not
+             * ∂(residual)/∂x[k]. The Kalman update is xp = x + K·v
+             * (filter() in rtkcmn.c), and that equation requires H to be
+             * the partial of the *predicted* measurement, not the residual.
+             *
+             * Predicted DD range-rate = (rrate_ru - rrate_rb) - (rrate_ju - rrate_jb)
+             * with rrate = e·(v_sat - v_rover) → partial wrt v_rover is -e.
+             * So DD partial = -e_ru + e_ju (rover-side terms only; base is static).
+             */
+            if (H) {
+                Hi = H + nv * rtk->nx;
+                for (k = 0; k < rtk->nx; k++) Hi[k] = 0.0;
+                Hi[3] = -eru[0] + eju[0];
+                Hi[4] = -eru[1] + eju[1];
+                Hi[5] = -eru[2] + eju[2];
+            }
+
+            double dop_gate = opt->maxinno_dop > 0.0 ? opt->maxinno_dop : 5.0;
+            if (fabs(v[nv]) > dop_gate) {
+                errmsg(rtk,"outlier rejected (sat=%3d-%3d D%d v=%.3f)\n",
+                       sat[iref], sat[j], 1, v[nv]);
+                continue;
+            }
+
+            /* Per-DD variance: the SD (single-difference rover-base) noise
+             * is sqrt(2) times the per-obs noise since rover and base
+             * Doppler measurements are independent. Mirroring varerr() in
+             * this file, which has `var = 2.0 * (...)` baked into the
+             * SD-equivalent it returns. Without this doubling, the EKF
+             * over-trusts Doppler observations by 2x in variance space. */
+            double sig_i = dop_err * CLIGHT/freqi;
+            double sig_j = dop_err * CLIGHT/freqj;
+            Ri[nv] = 2.0 * sig_i*sig_i;
+            Rj[nv] = 2.0 * sig_j*sig_j;
+
+            vflg[nv++] = (sat[iref]<<16) | (sat[j]<<8) | (2<<4);
+            nb[*b]++;
+        }
+        if (nb[*b] > 0) (*b)++;
+    }
+    return nv;
+}
+
+/* Test-only wrapper: forwards to the static ddres_dopobs. */
+extern int test_ddres_dopobs(rtk_t *rtk, const obsd_t *obs, const double *x,
+                             const int *sat, const double *e, const double *azel,
+                             const double *freq, const int *iu, const int *ir,
+                             int ns, const double *rs, const double *dts,
+                             double *v, double *H, double *Ri, double *Rj,
+                             int *vflg, int *nb, int *b, int nv)
+{
+    return ddres_dopobs(rtk, obs, x, sat, e, azel, freq, iu, ir, ns,
+                        rs, dts, v, H, Ri, Rj, vflg, nb, b, nv);
+}
+
 static int ddres(rtk_t *rtk, const obsd_t *obs, double dt, const double *x,
                  const double *P, const int *sat, double *y, double *e,
                  double *azel, double *freq, const int *iu, const int *ir,
-                 int ns, double *v, double *H, double *R, int *vflg)
+                 int ns, double *v, double *H, double *R, int *vflg,
+                 const double *rs, const double *dts)
 {
     prcopt_t *opt=&rtk->opt;
     double bl,dr[3],posu[3],posr[3],didxi=0.0,didxj=0.0,*im;
     double *tropr,*tropu,*dtdxr,*dtdxu,*Ri,*Rj,freqi,freqj,*Hi=NULL,df;
-    int i,j,k,m,f,nv=0,nb[NFREQ*NSYS*2+2]={0},b=0,sysi,sysj,nf=NF(opt);
+    /* +NSYS for the doppler-DD block (one group per GNSS system when
+       opt->dopobs is on); +2 retained for the constbl slots. */
+    int i,j,k,m,f,nv=0,nb[NFREQ*NSYS*2+2+NSYS]={0},b=0,sysi,sysj,nf=NF(opt);
     int frq,code;
 
     trace(3,"ddres   : dt=%.4f ns=%d\n",dt,ns);
@@ -1229,7 +1426,10 @@ static int ddres(rtk_t *rtk, const obsd_t *obs, double dt, const double *x,
     /* translate ecef pos to geodetic pos */
     ecef2pos(x,posu); ecef2pos(rtk->rb,posr);
 
-    Ri=mat(ns*nf*2+2,1); Rj=mat(ns*nf*2+2,1); im=mat(ns,1);
+    /* +ns extra slots for the doppler-DD block when opt->dopobs is on
+       (one obs per non-ref sat, capped by the per-system loop). Cheap to
+       always allocate; matches the sizing in relpos's caller arrays. */
+    Ri=mat(ns*nf*2+2+ns,1); Rj=mat(ns*nf*2+2+ns,1); im=mat(ns,1);
     tropu=mat(ns,1); tropr=mat(ns,1); dtdxu=mat(ns,3); dtdxr=mat(ns,3);
 
     /* zero out residual phase and code biases for all satellites */
@@ -1427,6 +1627,12 @@ static int ddres(rtk_t *rtk, const obsd_t *obs, double dt, const double *x,
             b++;
         }
     }  /* end of system loop */
+
+    /* doppler observations as kinematic-EKF velocity measurements (gated). */
+    if (opt->dopobs && opt->dynamics && opt->mode > PMODE_DGPS) {
+        nv = ddres_dopobs(rtk, obs, x, sat, e, azel, freq, iu, ir, ns,
+                          rs, dts, v, H, Ri, Rj, vflg, nb, &b, nv);
+    }
 
     /* baseline length constraint, for fixed distance between base and rover */
     if (rtk->opt.baseline[0]>0.0&&constbl(rtk,x,P,v,H,Ri,Rj,nv)) {
@@ -1979,7 +2185,9 @@ static int relpos(rtk_t *rtk, const obsd_t *obs, int nu, int nr,
     gtime_t time=obs[0].time;
     double *rs,*dts,*var,*y,*e,*azel,*freq,*v,*H,*R,*xp,*Pp,*xa,*bias,dt;
     int i,j,f,n=nu+nr,ns,ny,nv,sat[MAXSAT],iu[MAXSAT],ir[MAXSAT];
-    int info,vflg[MAXOBS*NFREQ*2+1],svh[MAXOBS*2];
+    /* +MAXOBS for the doppler-DD block (one slot per sat per epoch when
+       opt->dopobs is on); +1 for the constbl baseline-constraint slot. */
+    int info,vflg[MAXOBS*NFREQ*2+MAXOBS+1],svh[MAXOBS*2];
     int stat=rtk->opt.mode<=PMODE_DGPS?SOLQ_DGPS:SOLQ_FLOAT;
     int nf=opt->ionoopt==IONOOPT_IFLC?1:opt->nf;
 
@@ -2056,7 +2264,11 @@ static int relpos(rtk_t *rtk, const obsd_t *obs, int nu, int nr,
     matcpy(xp,rtk->x,rtk->nx,1);
     matcpy(Pp,rtk->P,rtk->nx,rtk->nx);
 
-    ny=ns*nf*2+2;
+    /* ns sats × nf freqs × {phase,code} + 2 (baseline constraint) + ns
+       (doppler-DD block when opt->dopobs is on). Always allocate the
+       doppler slots; the cost is small and avoids needing to plumb the
+       option flag through every site that sizes against `ny`. */
+    ny=ns*nf*2+2+ns;
     v=mat(ny,1); H=zeros(rtk->nx,ny); R=mat(ny,ny); bias=mat(rtk->nx,1);
 
     trace(3,"rover:  dt=%.3f\n",dt);
@@ -2091,7 +2303,7 @@ static int relpos(rtk_t *rtk, const obsd_t *obs, int nu, int nr,
                 O H = partial derivatives
                 O R = double diff measurement error covariances
                 O vflg = list of sats used for dd  */
-        if ((nv=ddres(rtk,obs,dt,xp,Pp,sat,y,e,azel,freq,iu,ir,ns,v,H,R,vflg))<4) {
+        if ((nv=ddres(rtk,obs,dt,xp,Pp,sat,y,e,azel,freq,iu,ir,ns,v,H,R,vflg,rs,dts))<4) {
             errmsg(rtk,"not enough double-differenced residual, n=%d\n", nv);
             stat=SOLQ_NONE;
             break;
@@ -2113,7 +2325,7 @@ static int relpos(rtk_t *rtk, const obsd_t *obs, int nu, int nr,
     if (stat!=SOLQ_NONE&&zdres(0,obs,nu,rs,dts,var,svh,nav,xp,opt,y,e,azel,freq)) {
 
         /* calc double diff residuals again after kalman filter update for float solution */
-        nv=ddres(rtk,obs,dt,xp,Pp,sat,y,e,azel,freq,iu,ir,ns,v,NULL,R,vflg);
+        nv=ddres(rtk,obs,dt,xp,Pp,sat,y,e,azel,freq,iu,ir,ns,v,NULL,R,vflg,rs,dts);
         
         /* validation of float solution, always returns 1, msg to trace file if large residual */
         if (valpos(rtk,v,R,vflg,nv,4.0)) {
@@ -2143,7 +2355,7 @@ static int relpos(rtk_t *rtk, const obsd_t *obs, int nu, int nr,
             if (zdres(0,obs,nu,rs,dts,var,svh,nav,xa,opt,y,e,azel,freq)) {
 
                 /* post-fit residuals for fixed solution (xa includes fixed phase biases, rtk->xa does not) */
-                nv=ddres(rtk,obs,dt,xa,Pp,sat,y,e,azel,freq,iu,ir,ns,v,NULL,R,vflg);
+                nv=ddres(rtk,obs,dt,xa,Pp,sat,y,e,azel,freq,iu,ir,ns,v,NULL,R,vflg,rs,dts);
 
                 /* validation of fixed solution, always returns valid */
                 if (valpos(rtk,v,R,vflg,nv,4.0)) {
